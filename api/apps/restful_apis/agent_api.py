@@ -32,7 +32,7 @@ from quart import Response, jsonify, request
 from api.apps import current_user, login_required
 from api.apps.services.canvas_replica_service import CanvasReplicaService
 from api.db import CanvasCategory
-from api.db.db_models import Task
+from api.db.db_models import APIToken, Task
 from api.db.services.api_service import API4ConversationService
 from api.db.services.canvas_service import (
     CanvasTemplateService,
@@ -822,11 +822,41 @@ def get_agent_version(agent_id, version_id, tenant_id):
         return get_data_error_result(message=f"Error getting history file: {exc}")
 
 
+async def _resolve_agent_logs_caller_tenant():
+    # Embedded full-screen / iframe chats send `Authorization: Bearer <beta>`
+    # where <beta> lives in `APIToken.beta`, not `APIToken.token`, so the
+    # standard `_load_user` fallback misses it. Try the beta lookup first;
+    # fall back to the regular login (JWT, api-token, session) afterwards so
+    # the dashboard UI keeps working unchanged.
+    authorization = (request.headers.get("Authorization") or "").strip()
+    if authorization.lower().startswith("bearer "):
+        parts = authorization.split(maxsplit=1)
+        if len(parts) == 2:
+            token = parts[1].strip()
+            if token:
+                objs = await thread_pool_exec(APIToken.query, beta=token)
+                if objs:
+                    return objs[0].tenant_id
+
+    user = current_user
+    return getattr(user, "id", None) if user else None
+
+
 @manager.route("/agents/<agent_id>/logs/<message_id>", methods=["GET"])  # noqa: F821
-@login_required
-@add_tenant_id_to_kwargs
-@_require_canvas_access_async
-async def get_agent_logs(agent_id, message_id, tenant_id):
+async def get_agent_logs(agent_id, message_id):
+    tenant_id = await _resolve_agent_logs_caller_tenant()
+    if not tenant_id:
+        return get_json_result(
+            data=False,
+            message="Authentication error: missing or invalid token.",
+            code=RetCode.AUTHENTICATION_ERROR,
+        )
+    if not await thread_pool_exec(UserCanvasService.accessible, agent_id, tenant_id):
+        return get_json_result(
+            data=False,
+            message="Make sure you have permission to access the agent.",
+            code=RetCode.OPERATING_ERROR,
+        )
     try:
         from rag.utils.redis_conn import REDIS_CONN
 
